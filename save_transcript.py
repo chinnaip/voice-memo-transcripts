@@ -35,18 +35,49 @@ def find_latest_m4a(recordings_dir: Path) -> Path:
     return max(m4a_files, key=lambda p: p.stat().st_mtime)
 
 
-def find_sidecar_json(m4a_path: Path) -> Path:
-    """Return the .json sidecar that lives in the same directory as m4a_path."""
+def find_sidecar_json(m4a_path: Path):
+    """Return the .json sidecar that lives in the same directory as m4a_path, or None."""
     parent = m4a_path.parent
     json_files = list(parent.glob("*.json"))
     if not json_files:
-        sys.exit(
-            f"ERROR: No JSON sidecar found alongside:\n  {m4a_path}\n"
-            "The transcript may not have been generated yet — "
-            "try opening the Voice Memos app and waiting for transcription to finish."
-        )
+        return None
     # If multiple JSON files exist pick the one with the most recent mtime.
     return max(json_files, key=lambda p: p.stat().st_mtime)
+
+
+def extract_transcript_from_m4a(m4a_path: Path) -> str:
+    """Extract transcript from the tsrp atom embedded in the .m4a file.
+
+    Apple encodes transcripts as a JSON blob prefixed with 'tsrp' inside the
+    MPEG-4 container. The JSON structure is:
+      {"attributedString": {"runs": ["word", <index>, ...], "attributeTable": [...]}}
+    Words occupy even indices of the runs array.
+    """
+    data = m4a_path.read_bytes()
+    marker = b'tsrp'
+    idx = data.find(marker)
+    if idx == -1:
+        return ""
+    json_bytes = data[idx + len(marker):]
+    brace_start = json_bytes.find(b'{')
+    if brace_start == -1:
+        return ""
+    depth = 0
+    for i, b in enumerate(json_bytes[brace_start:], brace_start):
+        if b == ord('{'):
+            depth += 1
+        elif b == ord('}'):
+            depth -= 1
+            if depth == 0:
+                raw = json_bytes[brace_start:i + 1].decode('utf-8', errors='replace')
+                try:
+                    obj = json.loads(raw)
+                    runs = obj["attributedString"]
+                    words = [r for r in runs if isinstance(r, str)]
+                    return " ".join(w.strip() for w in words if w.strip())
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    return ""
+    return ""
 
 
 def extract_transcript(json_path: Path) -> str:
@@ -120,15 +151,23 @@ def main():
     print(f"Latest recording : {m4a_path}")
     print(f"Timestamp        : {timestamp}")
 
-    # 2. Locate the sidecar JSON
+    # 2. Extract transcript — try JSON sidecar first, fall back to tsrp atom
     json_path = find_sidecar_json(m4a_path)
-    print(f"Sidecar JSON     : {json_path}")
-
-    # 3. Extract the transcript
-    transcript = extract_transcript(json_path)
+    if json_path:
+        print(f"Sidecar JSON     : {json_path}")
+        transcript = extract_transcript(json_path)
+    else:
+        print("Sidecar JSON     : not found, trying tsrp atom in .m4a")
+        transcript = extract_transcript_from_m4a(m4a_path)
+        if not transcript:
+            sys.exit(
+                f"ERROR: No transcript found for:\n  {m4a_path}\n"
+                "No JSON sidecar exists and no tsrp atom was found in the .m4a file.\n"
+                "Try opening the Voice Memos app and waiting for transcription to finish."
+            )
     print(f"Transcript length: {len(transcript)} characters")
 
-    # 4. Determine output path
+    # 3. Determine output path
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     out_filename = f"{timestamp}.txt"
     out_path = TRANSCRIPTS_DIR / out_filename
@@ -141,7 +180,7 @@ def main():
         print(transcript[:500])
         return
 
-    # 5. Idempotency: skip if already committed
+    # 4. Idempotency: skip if already committed
     if out_path.exists() and transcript_already_committed(relative_out):
         print(f"\nTranscript already committed ({relative_out}). Nothing to do.")
         return
@@ -150,7 +189,7 @@ def main():
     out_path.write_text(transcript, encoding="utf-8")
     print(f"\nWrote transcript : {relative_out}")
 
-    # 6. Commit and push
+    # 5. Commit and push
     git_run("add", relative_out)
     git_run("commit", "-m", f"Add transcript {out_filename}")
     git_run("push", "origin", "main")
