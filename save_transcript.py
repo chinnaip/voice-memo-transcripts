@@ -72,7 +72,13 @@ def extract_transcript_from_m4a(m4a_path: Path) -> str:
                 raw = json_bytes[brace_start:i + 1].decode('utf-8', errors='replace')
                 try:
                     obj = json.loads(raw)
-                    runs = obj["attributedString"]
+                    attr = obj["attributedString"]
+                    if isinstance(attr, list):
+                        runs = attr
+                    elif isinstance(attr, dict):
+                        runs = attr.get("runs", [])
+                    else:
+                        return ""
                     words = [r for r in runs if isinstance(r, str)]
                     return " ".join(w.strip() for w in words if w.strip())
                 except (json.JSONDecodeError, KeyError, TypeError):
